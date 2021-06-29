@@ -25,13 +25,19 @@ include_directories(${OpenCV_INCLUDE_DIR})
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -Wall -Ofast -Wfatal-errors -D_MWAITXINTRIN_H_INCLUDED")
 
+# maxLayer
 cuda_add_library(maxLayer SHARED ${PROJECT_SOURCE_DIR}/maxLayer.cu)
 target_link_libraries(maxLayer nvinfer cudart ${OpenCV_LIBS})
+
+# affineGridLayer
+cuda_add_library(affineGridLayer SHARED ${PROJECT_SOURCE_DIR}/affineGridLayer.cu)
+target_link_libraries(affineGridLayer nvinfer cudart ${OpenCV_LIBS})
 
 add_executable(inception ${PROJECT_SOURCE_DIR}/main.cpp)
 target_link_libraries(inception nvinfer)
 target_link_libraries(inception cudart)
 target_link_libraries(inception maxLayer)
+target_link_libraries(inception affineGridLayer)
 target_link_libraries(inception ${OpenCV_LIBS})
 
 add_definitions(-O2 -pthread)

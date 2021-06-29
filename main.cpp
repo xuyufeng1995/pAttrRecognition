@@ -12,6 +12,7 @@
 #include "cuda_runtime_api.h"
 #include "logging.h"
 #include <opencv2/opencv.hpp>
+#include <math.h>
 
 using namespace nvinfer1;
 
@@ -19,7 +20,7 @@ static Logger gLogger;
 
 static const int INPUT_H = 256;
 static const int INPUT_W = 128;
-static const int OUTPUT_SIZE = 1*93;
+static const int OUTPUT_SIZE = 1*8*4*2;
 
 const char* INPUT_BLOB_NAME = "data";
 const char* OUTPUT_BLOB_NAME = "prob";
@@ -211,32 +212,58 @@ IActivationLayer* ChannelAttn(INetworkDefinition *network, std::map<std::string,
     return relu2;
 }
 
-IConcatenationLayer* SpatialTransformBlock(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, std::string lname, int channel, int pooling_size) {
+IPluginV2Layer* SpatialTransformBlock(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, std::string lname, int channel, int pooling_size) {
     int index_per_class[19] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 2, 9, 2, 10, 11, 12, 13, 2, 14, 15};
     int attribute_per_class_merged[16] = {2, 2, 12, 3, 2, 2, 3, 4, 2, 3, 4, 3, 3, 5, 3, 4};
     ITensor* inputTensors[19];
 
-    for (int i = 0; i < 19; i++) {
-
-        IActivationLayer* relu1 = ChannelAttn(network,weightMap, input, lname + ".att_list." + std::to_string(i), channel, pooling_size);
+    //for (int i = 0; i < 19; i++) {
+        /// stn_feature = features * self.att_list[i](features) + features
+        IActivationLayer* relu1 = ChannelAttn(network,weightMap, input, lname + ".att_list." + std::to_string(0), channel, pooling_size);
         IElementWiseLayer* elem1 = network->addElementWise(input, *relu1->getOutput(0), ElementWiseOperation::kPROD);
         elem1 = network->addElementWise(*elem1->getOutput(0), input, ElementWiseOperation::kSUM);
 
+        /// theta_i = self.stn_list[i](F.avg_pool2d(stn_feature, stn_feature.size()[2:]).view(bs, -1)).view(-1, 4)
         IPoolingLayer* pool1 = network->addPoolingNd(*elem1->getOutput(0), PoolingType::kAVERAGE, DimsHW{pooling_size, pooling_size / 2});
         assert(pool1);
-        pool1->setStrideNd(DimsHW{1, 1});
-        pool1->setAverageCountExcludesPadding(false);
 
-        IFullyConnectedLayer* fc1 = network->addFullyConnected(*pool1->getOutput(0), attribute_per_class_merged[index_per_class[i]], weightMap[lname + ".fc_list." + std::to_string(index_per_class[i]) + ".weight"], weightMap[lname + ".fc_list." + std::to_string(index_per_class[i]) + ".bias"]);
+        IFullyConnectedLayer* fc1 = network->addFullyConnected(*pool1->getOutput(0), 4, weightMap[lname + ".stn_list." + std::to_string(index_per_class[0]) + ".weight"], weightMap[lname + ".stn_list." + std::to_string(index_per_class[0]) + ".bias"]);
         assert(fc1);
 
-        inputTensors[i] = fc1->getOutput(0);
-    }
+        /// theta_i = self.transform_theta(theta_i, i)
+        auto creator = getPluginRegistry()->getPluginCreator("AffineGridLayer_TRT", "1");
+        PluginField plugin_fields[1];
+        int featureMapShape[3] = {pooling_size, pooling_size / 2, 2};
+        plugin_fields[0].data = featureMapShape;
+        plugin_fields[0].length = 3;
+        plugin_fields[0].name = "featureMapShape";
+        plugin_fields[0].type = PluginFieldType::kFLOAT32;
+        PluginFieldCollection plugin_data;
+        plugin_data.nbFields = 1;
+        plugin_data.fields = plugin_fields;
+        IPluginV2 *pluginobj = creator->createPlugin("MaxLayer_TRT", &plugin_data);
+        ITensor* maxLayer[] = {fc1->getOutput(0)};
+        auto out = network->addPluginV2(maxLayer, 1, *pluginobj);
+        return out;
 
-    IConcatenationLayer* cat1 = network->addConcatenation(inputTensors, 19);
-    assert(cat1);
 
-    return cat1;
+        /// pred = self.gap_list[i](sub_feature).view(bs, -1)
+        IPoolingLayer* pool2 = network->addPoolingNd(*elem1->getOutput(0), PoolingType::kAVERAGE, DimsHW{pooling_size, pooling_size / 2});
+        assert(pool2);
+        pool2->setStrideNd(DimsHW{1, 1});
+        pool2->setAverageCountExcludesPadding(false);
+
+        /// pred = self.fc_list[self.index_per_class[i]](pred)
+        IFullyConnectedLayer* fc2 = network->addFullyConnected(*pool2->getOutput(0), attribute_per_class_merged[index_per_class[0]], weightMap[lname + ".fc_list." + std::to_string(index_per_class[0]) + ".weight"], weightMap[lname + ".fc_list." + std::to_string(index_per_class[0]) + ".bias"]);
+        assert(fc2);
+
+    //    inputTensors[i] = fc2->getOutput(0);
+    //}
+
+    //IConcatenationLayer* cat1 = network->addConcatenation(inputTensors, 19);
+    //assert(cat1);
+
+    //return cat1;
 }
 
 ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilderConfig* config, DataType dt)
@@ -332,21 +359,21 @@ ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
     IConcatenationLayer* cat3 = network->addConcatenation(fusion_3b, 2);
 
 
-    IConcatenationLayer* cat1 = SpatialTransformBlock(network, weightMap, *latlayer_5b->getOutput(0), "st_5b", 128, 8);
-    cat2 = SpatialTransformBlock(network, weightMap, *cat2->getOutput(0), "st_4d", 128 * 2, 16);
-    cat3 = SpatialTransformBlock(network, weightMap, *cat3->getOutput(0), "st_3b", 128 * 3, 32);
+    auto cat1 = SpatialTransformBlock(network, weightMap, *latlayer_5b->getOutput(0), "st_5b", 128, 8);
+//    cat2 = SpatialTransformBlock(network, weightMap, *cat2->getOutput(0), "st_4d", 128 * 2, 16);
+//    cat3 = SpatialTransformBlock(network, weightMap, *cat3->getOutput(0), "st_3b", 128 * 3, 32);
+//
+//    ITensor* outputTensors[] = {cat3->getOutput(0), cat2->getOutput(0), cat1->getOutput(0), fc1->getOutput(0)};
+//    IConcatenationLayer* cat4 = network->addConcatenation(outputTensors, 4);
+//
+//    auto creator = getPluginRegistry()->getPluginCreator("MaxLayer_TRT", "1");
+//    const PluginFieldCollection* pluginData = creator->getFieldNames();
+//    IPluginV2 *pluginobj = creator->createPlugin("MaxLayer_TRT", pluginData);
+//    ITensor* maxLayer[] = {cat4->getOutput(0)};
+//    auto out = network->addPluginV2(maxLayer, 1, *pluginobj);
 
-    ITensor* outputTensors[] = {cat3->getOutput(0), cat2->getOutput(0), cat1->getOutput(0), fc1->getOutput(0)};
-    IConcatenationLayer* cat4 = network->addConcatenation(outputTensors, 4);
-
-    auto creator = getPluginRegistry()->getPluginCreator("MaxLayer_TRT", "1");
-    const PluginFieldCollection* pluginData = creator->getFieldNames();
-    IPluginV2 *pluginobj = creator->createPlugin("MaxLayer_TRT", pluginData);
-    ITensor* maxLayer[] = {cat4->getOutput(0)};
-    auto out = network->addPluginV2(maxLayer, 1, *pluginobj);
-
-    out->getOutput(0)->setName(OUTPUT_BLOB_NAME);
-    network->markOutput(*out->getOutput(0));
+    cat1->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    network->markOutput(*cat1->getOutput(0));
 
     // Build engine
     builder->setMaxBatchSize(maxBatchSize);
@@ -448,7 +475,7 @@ int main(int argc, char** argv) {
 
     // Subtract mean from image
     static float data[3 * INPUT_H * INPUT_W];
-    cv::Mat img = cv::imread("/home/xuyufeng/projects/python/rider_convert/data/68649037-136623.jpg");
+    cv::Mat img = cv::imread("/home/xuyufeng/projects/python/rider_convert/data/D2A40B75-B292-EF6F-42E9-88CD04000000.jpg");
     cv::Mat re(INPUT_H, INPUT_W, CV_8UC3);
     cv::resize(img, re, re.size(), 0, 0, cv::INTER_LINEAR);
     int i = 0;
@@ -481,7 +508,7 @@ int main(int argc, char** argv) {
         std::ofstream outFile("trt_out.txt");
         for (int k = 0; k < OUTPUT_SIZE; k++) {
             outFile << prob[k] << " ";
-            if ((k + 1) % 93 == 0) outFile << std::endl;
+            if ((k + 1) % 4 == 0) outFile << std::endl;
         }
         outFile.close();
         std::cout << std::endl;
